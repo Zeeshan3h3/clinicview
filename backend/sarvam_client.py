@@ -1,0 +1,459 @@
+"""
+SwasthyaSync — Sarvam AI Client (Optimized)
+
+Changes from original:
+  - Uses a persistent httpx.Client with connection pooling (no new connection per call)
+  - Added timing logs to identify bottlenecks
+  - async-compatible via run_in_executor pattern
+  - Lightweight validation before API call
+
+Supports:
+  (a) Speech-to-Text (STT) — with automatic Indian language detection
+  (b) Text-to-Speech (TTS) — natural voice synthesis in 10 Indian languages
+
+Sarvam AI API docs: https://docs.sarvam.ai
+
+Supported languages:
+  hi-IN (Hindi), ta-IN (Tamil), te-IN (Telugu), kn-IN (Kannada),
+  bn-IN (Bengali), mr-IN (Marathi), gu-IN (Gujarati), ml-IN (Malayalam),
+  pa-IN (Punjabi), or-IN (Odia), en-IN (English)
+"""
+
+from __future__ import annotations
+import os
+import logging
+import time
+import httpx
+import base64
+from dotenv import load_dotenv
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
+SARVAM_BASE_URL = "https://api.sarvam.ai"
+
+# All supported Indian languages for the kiosk
+SUPPORTED_LANGUAGES = [
+    "hi-IN",   # Hindi
+    "ta-IN",   # Tamil
+    "te-IN",   # Telugu
+    "kn-IN",   # Kannada
+    "bn-IN",   # Bengali
+    "mr-IN",   # Marathi
+    "gu-IN",   # Gujarati
+    "ml-IN",   # Malayalam
+    "pa-IN",   # Punjabi
+    "or-IN",   # Odia
+    "en-IN",   # English (Indian)
+]
+
+LANGUAGE_NAMES = {
+    "hi-IN": "Hindi",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "kn-IN": "Kannada",
+    "bn-IN": "Bengali",
+    "mr-IN": "Marathi",
+    "gu-IN": "Gujarati",
+    "ml-IN": "Malayalam",
+    "pa-IN": "Punjabi",
+    "or-IN": "Odia",
+    "en-IN": "English",
+}
+
+# Default TTS voice per language (bulbul:v3 compatible speakers)
+TTS_SPEAKER = {
+    "hi-IN": "priya",
+    "ta-IN": "priya",
+    "te-IN": "priya",
+    "kn-IN": "priya",
+    "bn-IN": "priya",
+    "mr-IN": "priya",
+    "gu-IN": "priya",
+    "ml-IN": "priya",
+    "pa-IN": "priya",
+    "or-IN": "priya",
+    "en-IN": "priya",
+}
+
+
+def _headers() -> dict:
+    return {
+        "api-subscription-key": SARVAM_API_KEY,
+    }
+
+
+def _is_configured() -> bool:
+    if not SARVAM_API_KEY:
+        logger.warning("SARVAM_API_KEY not set — STT/TTS unavailable")
+        return False
+    return True
+
+
+def check_sarvam_health() -> dict:
+    """Return status of Sarvam client configuration."""
+    is_conf = bool(SARVAM_API_KEY)
+    return {
+        "configured": is_conf,
+        "stt_model": "saaras:v3",
+        "tts_model": "bulbul:v3",
+        "translation_model": "mayura:v1",
+        "supported_languages": len(SUPPORTED_LANGUAGES),
+        "status": "online" if is_conf else "unconfigured",
+    }
+
+
+def translate_text(
+    input_text: str,
+    source_language_code: str = "auto",
+    target_language_code: str = "en-IN",
+) -> dict:
+    """Translate text using Sarvam Mayura model."""
+    if not bool(SARVAM_API_KEY) or not input_text or not input_text.strip():
+        return {"translated_text": input_text, "source_language_code": source_language_code}
+
+    t0 = time.time()
+    try:
+        client = _get_http_client()
+        payload = {
+            "input": input_text,
+            "source_language_code": source_language_code,
+            "target_language_code": target_language_code,
+            "model": "mayura:v1",
+        }
+        res = client.post(
+            f"{SARVAM_BASE_URL}/translate",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=10.0,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            return {
+                "translated_text": data.get("translated_text", input_text),
+                "source_language_code": source_language_code,
+                "target_language_code": target_language_code,
+            }
+        else:
+            logger.warning(f"Mayura translation error {res.status_code}: {res.text}")
+            return {"translated_text": input_text, "source_language_code": source_language_code}
+    except Exception as e:
+        logger.warning(f"Mayura translation failed: {e}")
+        return {"translated_text": input_text, "source_language_code": source_language_code}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Persistent HTTP client with connection pooling
+# This avoids creating a new TCP connection + TLS handshake per call
+# ──────────────────────────────────────────────────────────────────────
+
+_http_client: httpx.Client | None = None
+
+def _get_http_client() -> httpx.Client:
+    """Return a singleton httpx client with connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.Client(
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+                keepalive_expiry=30.0,
+            ),
+        )
+        logger.info("Sarvam HTTP client initialized (persistent, pooled)")
+    return _http_client
+
+
+# ──────────────────────────────────────────────────────────────────────
+# STT: Speech-to-Text with automatic language detection
+# ──────────────────────────────────────────────────────────────────────
+
+def speech_to_text(
+    audio_bytes: bytes,
+    hint_language: str = "hi-IN",
+    audio_format: str = "webm",
+) -> dict:
+    """
+    Transcribe patient's speech to text using Sarvam AI.
+
+    Args:
+        audio_bytes: Raw audio from the browser (WebM/Opus by default)
+        hint_language: BCP-47 language code hint (used as primary language)
+        audio_format: 'webm', 'wav', 'mp3' — matches what browser sends
+
+    Returns:
+        {
+            "transcript": str,
+            "language_code": str,   # detected language (e.g. "hi-IN")
+            "language_name": str,   # human-readable (e.g. "Hindi")
+        }
+    """
+    if not _is_configured():
+        return {"transcript": "", "language_code": hint_language, "language_name": LANGUAGE_NAMES.get(hint_language, "Unknown")}
+
+    if not audio_bytes or len(audio_bytes) < 100:
+        logger.warning(f"STT: audio too short ({len(audio_bytes)} bytes), skipping")
+        return {"transcript": "", "language_code": hint_language, "language_name": LANGUAGE_NAMES.get(hint_language, "Unknown"), "error": "Audio too short"}
+
+    # Map audio format to MIME type
+    mime_map = {
+        "webm": "audio/webm",
+        "wav":  "audio/wav",
+        "mp3":  "audio/mp3",
+        "ogg":  "audio/ogg",
+    }
+    mime_type = mime_map.get(audio_format, "audio/webm")
+    filename = f"audio.{audio_format}"
+
+    t0 = time.time()
+    try:
+        client = _get_http_client()
+        response = client.post(
+            f"{SARVAM_BASE_URL}/speech-to-text",
+            headers=_headers(),
+            files={"file": (filename, audio_bytes, mime_type)},
+            data={
+                "language_code": hint_language,
+                "model": "saaras:v3",  # saarika:v2 was deprecated — use saaras:v3
+                "with_timestamps": "false",
+            },
+        )
+        elapsed = time.time() - t0
+        logger.info(
+            f"Sarvam STT took {elapsed:.2f}s | status={response.status_code} "
+            f"| size={len(audio_bytes)} bytes | lang={hint_language} | fmt={audio_format}"
+        )
+
+        # Log full response for debugging — critical for catching API errors
+        if response.status_code != 200:
+            logger.error(f"Sarvam STT non-200 response: {response.status_code} — {response.text}")
+            return {
+                "transcript": "",
+                "language_code": hint_language,
+                "language_name": LANGUAGE_NAMES.get(hint_language, "Unknown"),
+                "error": f"Sarvam API error {response.status_code}: {response.text[:200]}",
+            }
+
+        data = response.json()
+        logger.info(f"Sarvam STT raw response: {data}")
+
+        transcript = data.get("transcript", "")
+        detected_lang = data.get("language_code", hint_language)
+
+        logger.info(f"STT result: '{transcript[:80]}' | lang={detected_lang}")
+        return {
+            "transcript": transcript,
+            "language_code": detected_lang,
+            "language_name": LANGUAGE_NAMES.get(detected_lang, detected_lang),
+        }
+
+    except httpx.HTTPStatusError as e:
+        elapsed = time.time() - t0
+        logger.error(f"Sarvam STT HTTP error after {elapsed:.2f}s: {e.response.status_code} — {e.response.text}")
+        return {
+            "transcript": "",
+            "language_code": hint_language,
+            "language_name": LANGUAGE_NAMES.get(hint_language, "Unknown"),
+            "error": f"{e.response.status_code}: {e.response.text[:200]}",
+        }
+    except Exception as e:
+        elapsed = time.time() - t0
+        logger.error(f"Sarvam STT failed after {elapsed:.2f}s: {e}")
+        return {
+            "transcript": "",
+            "language_code": hint_language,
+            "language_name": LANGUAGE_NAMES.get(hint_language, "Unknown"),
+            "error": str(e),
+        }
+
+
+def _google_tts_fallback(text: str, language_code: str = "bn-IN") -> bytes:
+    """
+    High-quality authentic native fallback TTS via Google TTS service.
+    Produces clear native pronunciation for Bengali ('bn'), Hindi ('hi'),
+    Tamil ('ta'), Telugu ('te'), Kannada ('kn'), English ('en'), etc.
+    Returns MP3 audio bytes.
+    """
+    import urllib.request
+    import urllib.parse
+
+    if not text or not text.strip():
+        return b""
+
+    # Map BCP-47 / language_code to Google TTS 2-letter language code
+    lang_map = {
+        "bn-IN": "bn",
+        "bn": "bn",
+        "hi-IN": "hi",
+        "hi": "hi",
+        "ta-IN": "ta",
+        "ta": "ta",
+        "te-IN": "te",
+        "te": "te",
+        "kn-IN": "kn",
+        "kn": "kn",
+        "mr-IN": "mr",
+        "mr": "mr",
+        "gu-IN": "gu",
+        "gu": "gu",
+        "ml-IN": "ml",
+        "ml": "ml",
+        "pa-IN": "pa",
+        "pa": "pa",
+        "en-IN": "en",
+        "en": "en",
+    }
+    target_tl = lang_map.get(language_code, language_code.split("-")[0].lower() or "en")
+
+    # Split text into chunks under 140 chars for Google Translate TTS limits
+    words = text.strip().split()
+    chunks: list[str] = []
+    current_chunk = ""
+    for word in words:
+        if len(current_chunk) + len(word) + 1 > 140:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = word
+        else:
+            current_chunk = f"{current_chunk} {word}".strip()
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    if not chunks:
+        chunks = [text[:140]]
+
+    combined_mp3 = bytearray()
+    t0 = time.time()
+    for chunk in chunks:
+        url = (
+            f"https://translate.google.com/translate_tts"
+            f"?ie=UTF-8&q={urllib.parse.quote(chunk)}&tl={target_tl}&client=tw-ob"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "WebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
+                if resp.status == 200:
+                    combined_mp3.extend(resp.read())
+        except Exception as e:
+            logger.warning(f"Google TTS fallback chunk failed ({target_tl}): {e}")
+
+    elapsed = time.time() - t0
+    logger.info(
+        f"Google TTS fallback completed in {elapsed:.2f}s | "
+        f"chunks={len(chunks)} | bytes={len(combined_mp3)} | lang={target_tl}"
+    )
+    return bytes(combined_mp3)
+
+
+def text_to_speech(
+    text: str,
+    language_code: str = "hi-IN",
+    speaker: str | None = None,
+) -> bytes:
+    """
+    Convert text to speech audio using Sarvam AI with Google TTS native fallback.
+
+    Args:
+        text: The text to speak (can be in any supported Indian language)
+        language_code: BCP-47 language code (e.g. "bn-IN", "hi-IN")
+        speaker: Optional speaker name override
+
+    Returns:
+        Audio bytes (WAV from Sarvam or MP3 from Google TTS), or empty bytes on complete failure
+    """
+    if not text or not text.strip():
+        return b""
+
+    # If Sarvam is not configured, directly use the Google TTS native audio
+    if not _is_configured():
+        logger.info(f"Sarvam not configured — using Google TTS fallback for {language_code}")
+        return _google_tts_fallback(text, language_code)
+
+    selected_speaker = speaker or TTS_SPEAKER.get(language_code, "priya")
+
+    # Sarvam TTS has a 500-char limit per request — chunk if needed
+    chunks = _chunk_text(text, max_chars=490)
+    all_audio: list[bytes] = []
+
+    t0 = time.time()
+    try:
+        client = _get_http_client()
+        for chunk in chunks:
+            response = client.post(
+                f"{SARVAM_BASE_URL}/text-to-speech",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={
+                    "inputs": [chunk],
+                    "target_language_code": language_code,
+                    "speaker": selected_speaker,
+                    "pace": 1.0,
+                    "speech_sample_rate": 16000,
+                    "enable_preprocessing": True,
+                    "model": "bulbul:v3",
+                },
+                timeout=httpx.Timeout(connect=3.0, read=4.5, write=4.0, pool=3.0),
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Sarvam returns base64-encoded WAV in audios[]
+            audios = data.get("audios", [])
+            if audios:
+                audio_bytes = base64.b64decode(audios[0])
+                all_audio.append(audio_bytes)
+
+        elapsed = time.time() - t0
+        logger.info(f"Sarvam TTS took {elapsed:.2f}s | {len(all_audio)} chunk(s) | lang={language_code}")
+        if all_audio and all_audio[0]:
+            return all_audio[0]
+
+        logger.warning("Sarvam TTS returned empty audio — falling back to Google TTS")
+        return _google_tts_fallback(text, language_code)
+
+    except httpx.HTTPStatusError as e:
+        elapsed = time.time() - t0
+        logger.warning(
+            f"Sarvam TTS HTTP error after {elapsed:.2f}s ({e.response.status_code}) "
+            f"— falling back to native Google TTS for {language_code}"
+        )
+        return _google_tts_fallback(text, language_code)
+    except Exception as e:
+        elapsed = time.time() - t0
+        logger.warning(f"Sarvam TTS failed after {elapsed:.2f}s: {e} — falling back to native Google TTS")
+        return _google_tts_fallback(text, language_code)
+
+
+def _chunk_text(text: str, max_chars: int = 490) -> list[str]:
+    """Split text into chunks at sentence boundaries."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    sentences = text.replace("।", ".").split(".")
+    current = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        candidate = f"{current}. {s}" if current else s
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = s
+    if current:
+        chunks.append(current)
+
+    return chunks or [text[:max_chars]]

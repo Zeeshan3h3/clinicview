@@ -1,0 +1,266 @@
+"""
+SwasthyaSync v4 — Dynamic Schema Generator (Stage 1)
+
+Called ONCE per encounter, immediately after chief complaint + demographics.
+Uses a heavy model (Gemini 3.6 Flash) to generate a complaint-specific
+clinical interview schema.
+
+Two-call strategy:
+  1. Generate relevant categories (decide which sections matter for this complaint)
+  2. Expand each included category into specific fields
+
+The generated schema is then validated against the red-flag safety floor
+to ensure all must-ask fields are present.
+"""
+
+from __future__ import annotations
+import json
+import logging
+import time
+
+import llm_client
+from red_flag_library import get_safety_floor, get_safety_floor_as_text, merge_safety_floor
+
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 1 Schema Generation with Sarvam 105B
+# ──────────────────────────────────────────────────────────────────────
+SARVAM_SCHEMA_MODEL = "sarvam-105b"
+
+
+# Language names for demographic context
+LANGUAGE_NAMES = {
+    "hi-IN": "Hindi", "ta-IN": "Tamil", "te-IN": "Telugu",
+    "kn-IN": "Kannada", "bn-IN": "Bengali", "mr-IN": "Marathi",
+    "gu-IN": "Gujarati", "ml-IN": "Malayalam", "pa-IN": "Punjabi",
+    "or-IN": "Odia", "en-IN": "English",
+}
+
+
+def _build_schema_generation_prompt(
+    chief_complaint: str,
+    patient_age: int | None,
+    patient_sex: str,
+    category: str,
+    safety_floor_text: str,
+    doctor_custom_instructions: str | None = None,
+) -> tuple[str, str]:
+    """Build the system and user prompts for schema generation."""
+
+    age_str = f"{patient_age} years old" if patient_age else "age unknown"
+    sex_str = patient_sex or "unknown sex"
+    
+    doctor_instruction_text = ""
+    if doctor_custom_instructions:
+        doctor_instruction_text = f"\n\nCRITICAL DOCTOR INSTRUCTIONS:\nThe attending physician for this patient has provided the following custom intake instructions: \"{doctor_custom_instructions}\"\nYou MUST adjust your generated JSON schema to explicitly include fields that capture this specific information."
+
+    system_prompt = f"""You are a senior clinical consultant designing a structured patient interview schema.
+
+Your task: Given a patient's chief complaint and demographics, generate a detailed, complaint-specific JSON schema of fields that a medical interviewer should collect. This schema should mirror what an actual physician would ask based on the Macleod's Clinical Examination framework.{doctor_instruction_text}
+
+CRITICAL RULES:
+1. The schema must be HIGHLY SPECIFIC to the chief complaint. Do NOT include generic screening questions that are irrelevant (e.g., do NOT ask about family diabetes history for an isolated ankle sprain).
+2. Include fields from these categories ONLY if clinically relevant:
+   - HPI (History of Present Illness) — ALWAYS relevant
+   - PMH (Past Medical History) — include only if relevant to the complaint
+   - DH (Drug History / Allergies) — include if medications could be relevant
+   - FH (Family History) — include only if hereditary factors matter
+   - SH (Social History) — include only if lifestyle is relevant
+   - ROS (Review of Systems) — targeted, not exhaustive
+   - red_flag_check — ALWAYS include safety-critical screening questions
+3. Each field should have a clear, natural question_intent (what we want to learn).
+4. Assign priority: "critical" (must ask), "high" (should ask), "medium" (nice to have), "optional" (if time permits).
+5. Mark red_flag: true for any field where a positive answer indicates a medical emergency.
+6. Mark fork_eligible: true for fields where a POSITIVE/AFFIRMATIVE answer would need 1-2 targeted follow-up sub-questions. Examples:
+   - "Do you have vision changes?" → if YES, fork: "Which eye?" + "When did it start?"
+   - "Any previous surgeries?" → if YES, fork: "What surgery?" + "When?"
+   Most fields should be fork_eligible: false. Only tag 3-5 fields max per schema.
+7. Use conditional_on for fields that only matter given a previous answer (format: "field_id:value" or "field_id:*" for any value).
+8. Generate 15-30 fields total — enough for a thorough but not exhausting interview.
+
+ANTI-ASSUMPTION RULES (CRITICAL — violating these causes wrong questions):
+9. NEVER assume the anatomical location or subtype of pain from a vague complaint.
+   - If the chief complaint is "pain" or "ache" WITHOUT a specified location:
+     a. The FIRST field in the schema MUST be pain_location (anchor=true, conditional_on=null).
+     b. ALL other pain-characterization fields (radiation, character, onset, severity, etc.)
+        MUST have conditional_on="pain_location:*" so they only unlock after location is known.
+     c. Do NOT generate location-specific fields (e.g., joint_swelling, morning_stiffness)
+        without knowing the location first.
+   - If the chief complaint already specifies the location (e.g., "chest pain", "knee pain"),
+     you may generate location-specific fields directly.
+10. Mark anchor: true ONLY on fields that are universal prerequisites for the complaint type —
+    fields that must be answered before ANY other question makes clinical sense.
+    For pain: pain_location. For rash: rash_location. Never mark red_flag fields as anchor.
+
+The following fields are MANDATORY red-flag safety requirements for this complaint category. They MUST appear in your schema:
+{safety_floor_text}
+
+Output ONLY a JSON object with this exact structure:
+{{
+  "chief_complaint": "the complaint as understood",
+  "fields": [
+    {{
+      "id": "unique_snake_case_id",
+      "question_intent": "what this field is trying to learn, in plain language",
+      "type": "string",
+      "priority": "critical|high|medium|optional",
+      "red_flag": true/false,
+      "fork_eligible": true/false,
+      "anchor": true/false,
+      "category": "HPI|PMH|DH|FH|SH|ROS|red_flag_check",
+      "conditional_on": null
+    }}
+  ]
+}}"""
+
+    user_prompt = f"""Patient: {age_str}, {sex_str}
+Chief Complaint: {chief_complaint}
+Complaint Category: {category}
+
+Generate the clinical interview schema for this specific patient and complaint. Remember:
+- Be complaint-specific, not generic
+- Include the mandatory safety floor fields listed in your instructions
+{"- CRITICAL: You MUST include specific fields to capture the doctor's custom intake instructions." if doctor_custom_instructions else ""}
+- Order fields by clinical priority (most important first within each category)"""
+
+    return system_prompt, user_prompt
+
+
+def generate_schema(
+    chief_complaint: str,
+    patient_age: int | None,
+    patient_sex: str,
+    category: str,
+    doctor_custom_instructions: str | None = None,
+    clinic_mode: str = "allopathic",
+) -> dict:
+    """
+    Generate a complaint-specific clinical interview schema.
+    
+    Called ONCE per encounter after chief complaint capture.
+    Uses a heavier model for quality, with fallback to a static schema.
+    For AYUSH mode, loads deterministic CCRAS 14-predictor schema with zero LLM calls.
+    
+    Returns: A validated schema dict with "chief_complaint" and "fields" keys.
+    """
+    if str(clinic_mode).lower().strip() in ("ayush", "ayurveda"):
+        from ayush_templates import get_ayush_schema
+        raw_schema = get_ayush_schema(chief_complaint, category)
+        return _validate_schema(raw_schema, chief_complaint)
+
+    safety_floor_text = get_safety_floor_as_text(category)
+    system_prompt, user_prompt = _build_schema_generation_prompt(
+        chief_complaint, patient_age, patient_sex, category, safety_floor_text, doctor_custom_instructions
+    )
+
+    t0 = time.time()
+
+    # Generate schema using Sarvam 105B
+    schema = _call_model_for_schema(system_prompt, user_prompt, timeout_seconds=40.0)
+
+    # Fallback to static schema if Sarvam call fails
+    if schema is None:
+        logger.error("Sarvam schema generation failed — using static safety-floor fallback schema")
+        schema = _build_static_fallback(chief_complaint, category)
+
+    # SAFETY: Merge the must-ask safety floor into the schema
+    schema = merge_safety_floor(schema, category)
+
+    # Validate and clean
+    schema = _validate_schema(schema, chief_complaint)
+
+    elapsed = time.time() - t0
+    field_count = len(schema.get("fields", []))
+    logger.info(f"Schema generation took {elapsed:.2f}s | {field_count} fields | category={category}")
+
+    return schema
+
+
+def _call_model_for_schema(system_prompt: str, user_prompt: str, timeout_seconds: float = 40.0) -> dict | None:
+    """Call Sarvam 105B for schema generation with timeout protection. Returns None on failure."""
+    try:
+        result = llm_client._generate_json_with_retry(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.2,
+            max_tokens=6144,
+            timeout_seconds=timeout_seconds,
+        )
+
+        # Basic validation
+        if "fields" in result and isinstance(result["fields"], list):
+            logger.info(f"Schema generated by sarvam-105b: {len(result['fields'])} fields")
+            return result
+        else:
+            logger.warning("Schema from sarvam-105b missing 'fields' key")
+            return None
+
+    except Exception as e:
+        logger.error(f"Schema generation with sarvam-105b failed: {e}")
+        return None
+
+
+def _build_static_fallback(chief_complaint: str, category: str) -> dict:
+    """
+    Build a static fallback schema from the red-flag library.
+    Used when all LLM calls fail. Ensures the app never breaks.
+    """
+    safety_fields = get_safety_floor(category)
+    
+    # Add some universal baseline fields
+    baseline = [
+        {"id": "symptom_onset", "question_intent": "When did the problem start", "type": "string", "priority": "critical", "red_flag": False, "fork_eligible": False, "category": "HPI", "conditional_on": None},
+        {"id": "symptom_duration", "question_intent": "How long has it been going on", "type": "string", "priority": "critical", "red_flag": False, "fork_eligible": False, "category": "HPI", "conditional_on": None},
+        {"id": "symptom_severity_impact", "question_intent": "How much does it affect daily life", "type": "string", "priority": "high", "red_flag": False, "fork_eligible": False, "category": "HPI", "conditional_on": None},
+        {"id": "prior_episodes", "question_intent": "Has this happened before", "type": "string", "priority": "high", "red_flag": False, "fork_eligible": True, "category": "HPI", "conditional_on": None},
+        {"id": "current_medications", "question_intent": "Any medications currently being taken", "type": "string", "priority": "high", "red_flag": False, "fork_eligible": False, "category": "DH", "conditional_on": None},
+        {"id": "known_allergies", "question_intent": "Any known drug or food allergies", "type": "string", "priority": "high", "red_flag": False, "fork_eligible": True, "category": "DH", "conditional_on": None},
+        {"id": "chronic_conditions", "question_intent": "Any existing chronic health conditions (diabetes, hypertension, etc)", "type": "string", "priority": "medium", "red_flag": False, "fork_eligible": False, "category": "PMH", "conditional_on": None},
+    ]
+
+    # Merge baseline + safety floor, avoiding duplicates
+    existing_ids = {f["id"] for f in safety_fields}
+    all_fields = list(safety_fields)
+    for f in baseline:
+        if f["id"] not in existing_ids:
+            all_fields.append(f)
+
+    return {
+        "chief_complaint": chief_complaint,
+        "fields": all_fields,
+    }
+
+
+def _validate_schema(schema: dict, chief_complaint: str) -> dict:
+    """Validate and clean the generated schema."""
+    schema.setdefault("chief_complaint", chief_complaint)
+    fields = schema.get("fields", [])
+
+    # Ensure all fields have required keys
+    valid_fields = []
+    seen_ids = set()
+    for f in fields:
+        fid = f.get("id", "")
+        if not fid or fid in seen_ids:
+            continue
+        seen_ids.add(fid)
+
+        # Ensure defaults
+        f.setdefault("question_intent", f.get("id", "").replace("_", " "))
+        f.setdefault("type", "string")
+        f.setdefault("priority", "medium")
+        f.setdefault("red_flag", False)
+        f.setdefault("fork_eligible", False)
+        f.setdefault("anchor", False)  # Preserve anchor flag
+        f.setdefault("category", "HPI")
+        f.setdefault("conditional_on", None)
+
+        # Validate priority
+        if f["priority"] not in ("critical", "high", "medium", "optional"):
+            f["priority"] = "medium"
+
+        valid_fields.append(f)
+
+    schema["fields"] = valid_fields
+    return schema
