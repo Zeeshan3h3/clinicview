@@ -4,7 +4,8 @@
  */
 
 const API_BASE = window.location.origin;
-const WS_BASE = `ws://${window.location.host}/ws/session`;
+const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_BASE = `${wsProtocol}//${window.location.host}/ws/session`;
 
 // App State
 let currentLang = 'hi-IN';
