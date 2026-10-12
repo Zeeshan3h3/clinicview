@@ -336,6 +336,19 @@ async def websocket_session(ws: WebSocket):
 
 
 # Mount frontend static files
-frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
-if os.path.exists(frontend_dir):
+frontend_dir = None
+for candidate in [
+    os.path.join(os.path.dirname(__file__), "frontend"),
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend"),
+    os.path.join(os.getcwd(), "frontend"),
+]:
+    if os.path.exists(candidate) and os.path.exists(os.path.join(candidate, "index.html")):
+        frontend_dir = candidate
+        break
+
+if frontend_dir:
+    logger.info(f"Mounting frontend from: {frontend_dir}")
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+else:
+    logger.warning("No frontend directory found to mount")
+

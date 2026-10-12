@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>clinicView — AI Patient Kiosk</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="kiosk-container">
+    <!-- Top Navigation & Sarvam Status Bar -->
+    <header class="kiosk-header">
+      <div class="brand-section">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v20M2 12h20M5 5l14 14M5 19L19 5"/></svg>
+        </div>
+        <div>
+          <h1 class="brand-title">clinicView</h1>
+          <p class="brand-subtitle">Voice-First AI Patient Kiosk • ABDM Enabled</p>
+        </div>
+      </div>
+
+      <!-- Real-time Sarvam AI Health Badges -->
+      <div class="sarvam-badges" id="sarvam-badges">
+        <div class="badge" id="badge-stt">
+          <span class="status-dot"></span>
+          <span class="badge-label">STT: saaras:v3</span>
+        </div>
+        <div class="badge" id="badge-llm">
+          <span class="status-dot"></span>
+          <span class="badge-label">LLM: 105b</span>
+        </div>
+        <div class="badge" id="badge-trans">
+          <span class="status-dot"></span>
+          <span class="badge-label">Translate: mayura</span>
+        </div>
+        <div class="badge" id="badge-tts">
+          <span class="status-dot"></span>
+          <span class="badge-label">TTS: bulbul:v3</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- MAIN SCREENS CONTAINER -->
+    <main class="kiosk-main">
+      
+      <!-- SCREEN 1: LANGUAGE SELECTION -->
+      <section id="screen-language" class="screen active">
+        <div class="screen-hero">
+          <h2>Select Your Language / अपनी भाषा चुनें</h2>
+          <p>Touch your preferred language to start the voice consultation</p>
+        </div>
+
+        <div class="lang-grid">
+          <button class="lang-card" data-lang="hi-IN" data-name="Hindi">
+            <span class="lang-native">हिन्दी</span>
+            <span class="lang-en">Hindi</span>
+          </button>
+          <button class="lang-card" data-lang="en-IN" data-name="English">
+            <span class="lang-native">English</span>
+            <span class="lang-en">Indian English</span>
+          </button>
+          <button class="lang-card" data-lang="ta-IN" data-name="Tamil">
+            <span class="lang-native">தமிழ்</span>
+            <span class="lang-en">Tamil</span>
+          </button>
+          <button class="lang-card" data-lang="te-IN" data-name="Telugu">
+            <span class="lang-native">తెలుగు</span>
+            <span class="lang-en">Telugu</span>
+          </button>
+          <button class="lang-card" data-lang="bn-IN" data-name="Bengali">
+            <span class="lang-native">বাংলা</span>
+            <span class="lang-en">Bengali</span>
+          </button>
+          <button class="lang-card" data-lang="mr-IN" data-name="Marathi">
+            <span class="lang-native">मराठी</span>
+            <span class="lang-en">Marathi</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- SCREEN 2: ABDM LOGIN & PATIENT VERIFICATION -->
+      <section id="screen-auth" class="screen">
+        <div class="screen-hero">
+          <h2>ABDM Patient Identification</h2>
+          <p>Enter mobile number or tap a demo profile to link your Ayushman Bharat Digital Health record</p>
+        </div>
+
+        <!-- Quick Demo Profiles -->
+        <div class="demo-profiles-bar">
+          <span class="demo-label">Demo ABDM Profiles:</span>
+          <button class="chip-btn" onclick="selectDemoProfile('9088260058')">👤 Ramesh Verma (9088260058)</button>
+          <button class="chip-btn" onclick="selectDemoProfile('8420744956')">👤 Ananya Sen (8420744956)</button>
+          <button class="chip-btn" onclick="selectDemoProfile('9876543210')">👤 Walk-in Guest</button>
+        </div>
+
+        <div class="auth-card">
+          <div class="input-group">
+            <label for="phone-input">Mobile Number (Linked with Aadhaar/ABHA):</label>
+            <div class="input-row">
+              <span class="prefix">+91</span>
+              <input type="tel" id="phone-input" placeholder="Enter 10-digit mobile number" maxlength="10">
+              <button class="btn btn-primary" id="btn-send-otp">Verify with OTP</button>
+            </div>
+          </div>
+
+          <!-- OTP Box (Shown after click) -->
+          <div id="otp-container" class="otp-container hidden">
+            <label for="otp-input">Enter OTP (Sandbox Test Code: <strong>123456</strong>):</label>
+            <div class="input-row">
+              <input type="text" id="otp-input" value="123456" maxlength="6">
+              <button class="btn btn-accent" id="btn-confirm-otp">Verify & Proceed</button>
+            </div>
+          </div>
+
+          <!-- Verified Patient Card -->
+          <div id="verified-patient-card" class="verified-card hidden">
+            <div class="patient-header">
+              <div class="patient-avatar">👤</div>
+              <div>
+                <h3 id="p-name">Ramesh Verma</h3>
+                <p id="p-meta">Age: 38 • Male • ABHA: 91-1001-2001-3001</p>
+              </div>
+              <span class="abdm-verified-badge">✓ ABDM Verified</span>
+            </div>
+            <div id="followup-alert" class="followup-banner hidden">
+              ℹ️ <strong>Follow-up Visit</strong>: Previous history retrieved from records.
+            </div>
+            <button class="btn btn-success btn-lg" id="btn-start-intake">Start Voice Clinical Intake →</button>
+          </div>
+
+          <div style="text-align: center; margin-top: 18px;">
+            <button class="skip-walkin-btn" onclick="skipToInterview()">⚡ Skip Directly to Interview (Walk-in Citizen)</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCREEN 3: VOICE-FIRST CLINICAL INTAKE -->
+      <section id="screen-intake" class="screen">
+        <!-- Progress Indicator -->
+        <div class="intake-progress-header">
+          <span class="progress-section" id="progress-section">Chief Complaint</span>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar-fill" id="progress-fill" style="width: 15%;"></div>
+          </div>
+          <span class="progress-text" id="progress-percent">15%</span>
+        </div>
+
+        <!-- Assistant Question & Orb -->
+        <div class="conversation-display">
+          <!-- Pulsing Voice Orb -->
+          <div class="orb-container">
+            <div class="voice-orb" id="voice-orb">
+              <div class="orb-core"></div>
+              <div class="orb-wave wave-1"></div>
+              <div class="orb-wave wave-2"></div>
+            </div>
+            <span class="orb-status" id="orb-status">Listening...</span>
+          </div>
+
+          <!-- Assistant Spoken Text Card -->
+          <div class="assistant-prompt-card">
+            <div class="prompt-icon">🤖</div>
+            <div class="prompt-content">
+              <p class="prompt-text" id="prompt-text">नमस्ते! clinicView में आपका स्वागत है। आज आपको क्या परेशानी या तकलीफ हो रही है?</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live Chat History -->
+        <div class="chat-history-container" id="chat-history">
+          <!-- Chat bubbles dynamically appended here -->
+        </div>
+
+        <!-- Touch Option Chips -->
+        <div class="options-container" id="options-container">
+          <!-- Dynamic Quick Chips -->
+        </div>
+
+        <!-- Text Input & Submit Bar -->
+        <div class="text-input-bar">
+          <input type="text" id="text-input" placeholder="Type your answer or select an option above..." />
+          <button class="btn btn-primary" id="btn-send-text">Send ➔</button>
+        </div>
+
+        <!-- Real-Time Voice Recording Bar -->
+        <div class="voice-controls-bar">
+          <button class="mic-button" id="btn-mic">
+            <span class="mic-icon">🎙️</span>
+            <span class="mic-label" id="mic-label">Speak (Tap Mic)</span>
+          </button>
+          <button class="btn btn-secondary" id="btn-next-action">Next ➔</button>
+          <button class="btn btn-secondary" id="btn-skip">Skip</button>
+        </div>
+
+        <!-- Live Transcript Bubble -->
+        <div class="transcript-box" id="transcript-box">
+          <span class="transcript-label">Live Patient Speech:</span>
+          <span class="transcript-text" id="live-transcript">Waiting for speech...</span>
+        </div>
+      </section>
+
+      <!-- SCREEN 4: CLINICAL HANDOVER & ABDM RECEIPT -->
+      <section id="screen-summary" class="screen">
+        <div class="summary-card">
+          <div class="summary-header">
+            <div>
+              <span class="token-badge" id="sum-token">TOKEN #2026-A1</span>
+              <h2>Clinical Handover Note</h2>
+              <p id="sum-patient-line">Patient: Ramesh Verma • ABHA ID: 91-1001-2001-3001</p>
+            </div>
+            <div class="qr-box" id="qr-box">
+              <div class="qr-mock">ABDM<br>QR</div>
+            </div>
+          </div>
+
+          <div class="summary-tabs">
+            <button class="tab-btn active" onclick="switchTab('doctor')">Doctor's Handover (English)</button>
+            <button class="tab-btn" onclick="switchTab('patient')">Patient Summary (हिन्दी / Vernacular)</button>
+          </div>
+
+          <div class="summary-body" id="tab-doctor">
+            <h3>Clinical Narrative (Macleod Framework):</h3>
+            <p class="narrative-text" id="doc-narrative">Patient presents with severe episodic headache and low-grade pyrexia for 2 days. Denies photophobia or neck stiffness.</p>
+            
+            <div class="highlights-box">
+              <h4>Critical Clinical Highlights:</h4>
+              <ul id="doc-highlights">
+                <li>Acute headache with pyrexia</li>
+                <li>Blood pressure recorded at 120/80 mmHg</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="summary-body hidden" id="tab-patient">
+            <h3>मरीज का सारांश (Sarvam Mayura द्वारा अनुवादित):</h3>
+            <p class="narrative-text" id="pat-narrative">मरीज को पिछले 2 दिनों से तेज सिरदर्द और हल्का बुखार है। कोई गंभीर गर्दन अकड़न नहीं है।</p>
+          </div>
+
+          <div class="summary-actions">
+            <button class="btn btn-primary" onclick="window.print()">🖨️ Print OPD Receipt</button>
+            <button class="btn btn-secondary" onclick="restartKiosk()">🔄 New Patient Check-in</button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
