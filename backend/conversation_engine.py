@@ -121,16 +121,21 @@ Extract any field values from the patient's latest message."""
 
     try:
         result = llm_client.conversation_turn(system_prompt, user_prompt, temperature=0.1)
-        extracted = result.get("extracted_fields", {})
+        extracted = result.get("extracted_fields") or result.get("extracted_data") or result.get("fields") or {}
+        if not isinstance(extracted, dict):
+            extracted = {}
         
         # Validate: only accept fields that are in our unfilled list
         valid_field_ids = {f["id"] for f in unfilled_fields}
         validated = {}
         for fid, entry in extracted.items():
-            if fid in valid_field_ids and isinstance(entry, dict) and entry.get("value"):
-                validated[fid] = entry
+            if fid in valid_field_ids:
+                if isinstance(entry, dict) and entry.get("value"):
+                    validated[fid] = entry
+                elif isinstance(entry, (str, int, float, bool)) and str(entry).strip():
+                    validated[fid] = {"value": str(entry).strip(), "confidence": 0.85}
         
-        logger.info(f"Extraction: {len(validated)} fields extracted from patient message")
+        logger.info(f"Extraction: {len(validated)} fields extracted from patient message: {list(validated.keys())}")
         return validated
 
     except Exception as e:

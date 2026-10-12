@@ -713,5 +713,51 @@ input:focus {
   background: rgba(14, 165, 233, 0.1);
 }
 
+/* Captured Fields Tray */
+.captured-fields-tray {
+  max-width: 720px;
+  width: 100%;
+  margin: 10px auto;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+
+.tray-header {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #94a3b8;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.fields-chips-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.field-chip {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #a7f3d0;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.field-chip strong {
+  color: #fff;
+}
+
+.no-fields-msg {
+  font-size: 0.8rem;
+  color: #64748b;
+  font-style: italic;
+}
+
 .hidden { display: none !important; }
 

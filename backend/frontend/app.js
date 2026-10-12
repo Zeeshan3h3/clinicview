@@ -223,6 +223,22 @@ function handleUiUpdate(ui) {
     });
   }
 
+  // Update Live Captured Fields Tray
+  if (ui.filled_fields && ui.filled_fields.length > 0) {
+    const list = document.getElementById('fields-chips-list');
+    const count = document.getElementById('fields-count');
+    if (list && count) {
+      count.textContent = ui.filled_fields.length;
+      list.innerHTML = '';
+      ui.filled_fields.forEach(f => {
+        const chip = document.createElement('div');
+        chip.className = 'field-chip';
+        chip.innerHTML = `<strong>${f.label}:</strong> ${f.value}`;
+        list.appendChild(chip);
+      });
+    }
+  }
+
   // Play TTS audio if attached
   if (ui.audio_b64) {
     playBase64Audio(ui.audio_b64);

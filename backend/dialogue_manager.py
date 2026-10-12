@@ -46,6 +46,7 @@ class DialogueManager:
         # before generating the schema.
         self._pending_qualifier: dict | None = None
         self._raw_chief_complaint: str = ""
+        self._current_target_field: dict | None = None
 
     # ──────────────────────────────────────────────────────────────────
     # PUBLIC API
@@ -395,6 +396,18 @@ class DialogueManager:
             doctor_custom_instructions=self.record.doctor_custom_instructions,
         )
 
+        # 2.1 DIRECT ANSWER MAPPING: If the LLM didn't extract the target field,
+        # but the patient directly answered the current question, map it!
+        if self._current_target_field and value.strip():
+            cur_id = self._current_target_field.get("id")
+            if cur_id and cur_id not in extracted:
+                extracted[cur_id] = {
+                    "value": value.strip(),
+                    "confidence": 0.95,
+                    "source": "direct_answer",
+                }
+                logger.info(f"Direct mapping for current question: {cur_id} = '{value.strip()}'")
+
         # 3. Update filled_state with extracted data
         for fid, entry in extracted.items():
             self.record.update_filled_state(
@@ -402,28 +415,38 @@ class DialogueManager:
                 entry.get("value"),
                 entry.get("confidence", 0.8),
             )
-            logger.debug(f"Filled: {fid} = {entry.get('value')}")
+            logger.info(f"✅ Field Filled: {fid} = '{entry.get('value')}'")
 
-        # 3.5 FORK CHECK: Did we just fill a fork_eligible field with a significant answer?
+        # 3.5 CROSS-QUESTIONING & FORK CHECK:
+        # Check if the answer warrants immediate follow-up cross-questions
         for fid, entry in extracted.items():
             field_spec = next((f for f in schema.get("fields", []) if f["id"] == fid), None)
-            if field_spec and field_spec.get("fork_eligible", False):
-                fork_result = conversation_engine.check_and_generate_fork_questions(
-                    parent_field=field_spec,
-                    patient_answer=str(entry.get("value", "")),
-                    chief_complaint=self.record.chief_complaint.value if self.record.chief_complaint else "",
-                    language=self.language,
-                    doctor_custom_instructions=self.record.doctor_custom_instructions,
-                )
-                if fork_result:
-                    # Inject sub-fields into the live schema
-                    existing_ids = {f["id"] for f in schema["fields"]}
-                    for sub_field in fork_result:
-                        sub_id = sub_field["id"]
-                        if sub_id not in existing_ids:
-                            schema["fields"].append(sub_field)
-                            self.record.filled_state[sub_id] = {"value": None, "confidence": 0.0}
-                    logger.info(f"Fork triggered on '{fid}': injected {len(fork_result)} sub-fields")
+            val_str = str(entry.get("value", "")).strip().lower()
+            
+            # Significant answer check: affirmative or descriptive symptoms
+            is_affirmative = any(a in val_str for a in ["yes", "ha", "haan", "true", "severe", "moderate", "often", "always", "sometimes", "sharp", "burning", "heavy"])
+            is_descriptive = len(val_str) > 4 and not conversation_engine._is_negative_answer(val_str)
+            
+            if field_spec and (field_spec.get("fork_eligible", False) or is_affirmative or is_descriptive):
+                # Avoid infinite sub-forks on sub-questions
+                if "__" not in fid:
+                    fork_result = conversation_engine.check_and_generate_fork_questions(
+                        parent_field=field_spec,
+                        patient_answer=str(entry.get("value", "")),
+                        chief_complaint=self.record.chief_complaint.value if self.record.chief_complaint else "",
+                        language=self.language,
+                        doctor_custom_instructions=self.record.doctor_custom_instructions,
+                    )
+                    if fork_result:
+                        existing_ids = {f["id"] for f in schema["fields"]}
+                        for sub_field in fork_result:
+                            sub_id = sub_field["id"]
+                            if sub_id not in existing_ids:
+                                sub_field["anchor"] = True  # Prioritize to ask IMMEDIATELY
+                                sub_field["priority"] = "critical"
+                                schema["fields"].insert(0, sub_field)  # Insert at front of queue
+                                self.record.filled_state[sub_id] = {"value": None, "confidence": 0.0}
+                        logger.info(f"⚡ Cross-questioning generated for '{fid}': {[s['id'] for s in fork_result]}")
 
         # 4. SAFETY CHECK: run deterministic rules
         safety_flags = check_safety(self.record.filled_state)
@@ -443,7 +466,6 @@ class DialogueManager:
             logger.info(f"Interview complete at turn {self.record.interview_turn_count}")
             self.fsm.advance()  # → DOCUMENT_SCAN
             self.record.macro_state = self.fsm.state
-            # Removed db checkpoint here, handled in main.py
             return self._build_ui_instruction()
 
         # 6. SELECT NEXT FIELD
@@ -452,7 +474,6 @@ class DialogueManager:
             # All fields filled — advance
             self.fsm.advance()
             self.record.macro_state = self.fsm.state
-            # Removed db checkpoint here, handled in main.py
             return self._build_ui_instruction()
 
         # 7. GENERATE QUESTION for the selected field
@@ -474,8 +495,6 @@ class DialogueManager:
             "assistant", result.spoken_text, next_field.get("category", "HPI")
         )
 
-        # Removed db checkpoint here, handled in main.py
-
         # 8. Build UI response
         return self._build_dynamic_ui(result, next_field)
 
@@ -489,9 +508,18 @@ class DialogueManager:
         current_field: dict | None = None,
     ) -> dict:
         """Build UI instruction for the dynamic interview."""
+        self._current_target_field = current_field  # Track current target field
         schema = self.record.dynamic_schema or {"fields": []}
         progress = field_selector.get_progress(schema, self.record.filled_state)
         category_label = field_selector.get_current_category_label(schema, self.record.filled_state)
+
+        # Build list of filled fields for UI display
+        filled_list = []
+        for fid, entry in self.record.filled_state.items():
+            if isinstance(entry, dict) and entry.get("value"):
+                field_obj = next((f for f in schema.get("fields", []) if f["id"] == fid), None)
+                label = field_obj.get("question_intent", fid.replace("_", " ").title()) if field_obj else fid.replace("_", " ").title()
+                filled_list.append({"id": fid, "label": label, "value": str(entry.get("value"))})
 
         options_out = []
         for opt in result.suggested_options:
@@ -513,6 +541,7 @@ class DialogueManager:
             "section_label": category_label,
             "can_skip": True,
             "progress": progress,
+            "filled_fields": filled_list,
             "section_summary": self.record.get_filled_summary(),
             "conversation_history": self.record.conversation_history[-6:],
         }
